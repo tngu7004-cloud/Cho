@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+ICT Scanner - quét TẤT CẢ hợp đồng vĩnh cửu USDⓈ-M Futures trên Binance, báo tín hiệu về Telegram.
+Mô hình: Liquidity Sweep -> MSS (displacement) -> hồi về FVG (cùng logic với ICT_Signals.pine)
+Phân hạng: (1) XAU, XAG, BTC, ETH  >  (2) Altcoin  >  (3) Meme coin
+
+Cài đặt:  pip install requests tzdata
+Chạy thử: python ict_scanner.py --once
+Chạy liên tục: python ict_scanner.py --tf 15m
+Telegram: đặt biến môi trường TELEGRAM_TOKEN và TELEGRAM_CHAT_ID (nếu không đặt, chỉ in ra màn hình).
+Chỉ dùng dữ liệu công khai, KHÔNG cần API key, KHÔNG đặt lệnh.
+"""
+import os, sys, time, json, argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
+
+import requests
+
+try:
+    from zoneinfo import ZoneInfo
+    NY = ZoneInfo("America/New_York")
+except Exception:
+    NY = timezone(timedelta(hours=-5))
+
+BASE = os.getenv("BINANCE_BASE", "https://fapi.binance.com")  # USDⓈ-M Futures
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
+SENT_FILE = "sent_signals.json"
+SESSION = requests.Session()
+
+STABLES = {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "USDE", "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL"}
+# ---- Phân hạng ưu tiên ----
+PRIORITY = ["XAUUSDT", "XAGUSDT", "BTCUSDT", "ETHUSDT"]  # hạng 1: luôn được quét, báo trước, báo to
+# Hạng 3 (meme): sửa danh sách này tuỳ ý. Tiền tố 1000/1M (vd 1000PEPE) được tự bỏ khi so khớp.
+MEME_COINS = {
+    "DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "TURBO", "BOME", "NEIRO", "PNUT", "ACT",
+    "POPCAT", "MOG", "BRETT", "PENGU", "TRUMP", "FARTCOIN", "MEW", "GOAT", "MOODENG", "HMSTR", "CATI",
+    "DOGS", "BABYDOGE", "CHEEMS", "MUBARAK", "BROCCOLI", "SPX", "GIGA", "FWOG", "PONKE", "MYRO", "WEN",
+    "DEGEN", "USELESS", "BANANAS31", "TOSHI", "SLERF", "MELANIA", "LIBRA", "PEOPLE", "COQ", "LADYS",
+}
+TF_SECONDS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}
+
+
+# ---------------------------------------------------------------- Binance
+def get(path, params=None):
+    for _ in range(4):
+        r = SESSION.get(BASE + path, params=params, timeout=15)
+        if r.status_code in (418, 429):
+            time.sleep(int(r.headers.get("Retry-After", 5)))
+            continue
+        if r.status_code in (451, 403):
+            raise RuntimeError(f"Binance Futures chặn IP/vị trí hiện tại (HTTP {r.status_code}). "
+                               "Hãy chạy từ máy ở nước được hỗ trợ (không phải Mỹ) hoặc dùng VPS ngoài Mỹ.")
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError("Rate limited")
+
+
+def strip_prefix(base):
+    for p in ("1000000", "1000", "1M"):
+        if base.startswith(p) and len(base) > len(p):
+            return base[len(p):]
+    return base
+
+
+def tier_of(symbol, base):
+    if symbol in PRIORITY:
+        return 1
+    if strip_prefix(base) in MEME_COINS:
+        return 3
+    return 2
+
+
+def list_symbols(min_quote_vol):
+    """Trả về [(symbol, tier)] của các hợp đồng PERPETUAL USDT đang giao dịch."""
+    info = get("/fapi/v1/exchangeInfo")
+    meta = {}
+    for s in info["symbols"]:
+        if s.get("contractType") != "PERPETUAL" or s.get("status") != "TRADING":
+            continue
+        if s.get("quoteAsset") != "USDT":
+            continue
+        base = s["baseAsset"]
+        if base in STABLES or base == "BTCDOM":
+            continue
+        meta[s["symbol"]] = base
+    tick = get("/fapi/v1/ticker/24hr")
+    vol = {t["symbol"]: float(t["quoteVolume"]) for t in tick}
+    out = []
+    for sym, base in meta.items():
+        t = tier_of(sym, base)
+        if t == 1 or vol.get(sym, 0) >= min_quote_vol:  # hạng 1 bỏ qua lọc khối lượng
+            out.append((sym, t))
+    miss = [p for p in PRIORITY if p not in meta]
+    if miss:
+        print("Cảnh báo: không thấy hợp đồng ưu tiên:", ", ".join(miss), file=sys.stderr)
+    return sorted(out)
+
+
+def klines(symbol, interval, limit=300):
+    rows = get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    rows = rows[:-1]  # bỏ nến đang chạy, chỉ dùng nến đã đóng
+    return {
+        "t": [int(x[0]) for x in rows], "o": [float(x[1]) for x in rows],
+        "h": [float(x[2]) for x in rows], "l": [float(x[3]) for x in rows],
+        "c": [float(x[4]) for x in rows],
+    }
+
+
+# ---------------------------------------------------------------- Indicators
+def atr_series(H, L, C, n=14):
+    tr = [H[0] - L[0]] + [max(H[i] - L[i], abs(H[i] - C[i - 1]), abs(L[i] - C[i - 1])) for i in range(1, len(H))]
+    out = [None] * len(tr)
+    if len(tr) < n:
+        return out
+    out[n - 1] = sum(tr[:n]) / n
+    for i in range(n, len(tr)):
+        out[i] = (out[i - 1] * (n - 1) + tr[i]) / n
+    return out
+
+
+def ema_last(values, n):
+    k = 2 / (n + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def pivot_high(H, i, L):
+    c = i - L
+    if c - L < 0:
+        return None
+    if H[c] > max(H[c - L:c]) and H[c] >= max(H[c + 1:i + 1]):
+        return H[c]
+    return None
+
+
+def pivot_low(Lw, i, L):
+    c = i - L
+    if c - L < 0:
+        return None
+    if Lw[c] < min(Lw[c - L:c]) and Lw[c] <= min(Lw[c + 1:i + 1]):
+        return Lw[c]
+    return None
+
+
+def in_killzone(ts_ms):
+    t = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY)
+    m = t.hour * 60 + t.minute
+    return (120 <= m < 300) or (420 <= m < 600) or (810 <= m < 960)
+
+
+def ny_min(ts_ms):
+    t = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(NY)
+    return t.hour * 60 + t.minute
+
+
+def session_name(ts_ms):
+    m = ny_min(ts_ms)
+    if 120 <= m < 300: return "London killzone"
+    if 420 <= m < 600: return "NY AM killzone"
+    if 810 <= m < 960: return "NY PM killzone"
+    if m >= 1200: return "Asia"
+    return "Ngoài killzone"
+
+
+def silver_bullet(ts_ms):
+    m = ny_min(ts_ms)
+    if 180 <= m < 240: return "London SB 03-04h NY"
+    if 600 <= m < 660: return "NY AM SB 10-11h NY"
+    if 840 <= m < 900: return "NY PM SB 14-15h NY"
+    return None
+
+
+def classify(side, rec, e, ts_ms, pd_fn):
+    """Gắn nhãn mô hình ICT + mô tả chuỗi ① Sweep ② MSS ③ FVG."""
+    bull = side == "LONG"
+    leg_hi, leg_lo = (rec["leg"], rec["sweep"]) if bull else (rec["sweep"], rec["leg"])
+    span = leg_hi - leg_lo
+    retr = ((leg_hi - e) if bull else (e - leg_lo)) / span if span > 0 else None
+    ote = retr is not None and 0.62 <= retr <= 0.79
+    sb = silver_bullet(ts_ms)
+    model = f"Silver Bullet ({sb})" if sb else "ICT 2022 Model (Sweep → MSS → FVG)"
+    if ote:
+        model += " + OTE"
+    liq_name = ("Sell-side liquidity (SSL)" if bull else "Buy-side liquidity (BSL)")
+    if rec["eql"]:
+        liq_name += " dạng Equal " + ("Lows" if bull else "Highs")
+    tags = [session_name(ts_ms)]
+    pdh, pdl = pd_fn()
+    if bull and pdl is not None and rec["sweep"] < pdl:
+        tags.append(f"Quét PDL {fmt(pdl)}")
+    if (not bull) and pdh is not None and rec["sweep"] > pdh:
+        tags.append(f"Quét PDH {fmt(pdh)}")
+    if retr is not None:
+        tags.append(f"Hồi {retr * 100:.0f}% cú dịch chuyển" + (" (trong OTE 62-79%)" if ote else ""))
+    return {
+        "model": model,
+        "sweep_txt": f"Sweep {liq_name} tại {fmt(rec['lvl'])} (đỉnh/đáy râu {fmt(rec['sweep'])})",
+        "mss_txt": f"MSS {'phá lên' if bull else 'phá xuống'} {fmt(rec['mss'])}, displacement {rec['dstr']:.1f}×ATR",
+        "fvg_txt": f"Giá hồi vào FVG {fmt(min(rec['top'], rec['bot']))} – {fmt(max(rec['top'], rec['bot']))}",
+        "tags": tags,
+    }
+
+
+# ---------------------------------------------------------------- ICT logic
+def detect(d, P, htf_bias_fn, pd_fn):
+    """Chạy state machine trên toàn bộ nến; chỉ trả tín hiệu nếu nó xảy ra ở nến đóng gần nhất."""
+    H, Lw, C, O, T = d["h"], d["l"], d["c"], d["o"], d["t"]
+    n = len(C)
+    if n < 60:
+        return None
+    A = atr_series(H, Lw, C)
+    liq_h = liq_l = int_h = int_l = None
+    liq_h_prev = liq_l_prev = None
+    bS = sS = 0
+    b = {}
+    s = {}
+    last = n - 1
+
+    def dstr(i):
+        x = abs(C[i] - O[i]) / A[i]
+        if i > 0 and A[i - 1]:
+            x = max(x, abs(C[i - 1] - O[i - 1]) / A[i - 1])
+        return x
+
+    for i in range(n):
+        if A[i] is None:
+            continue
+        atr = A[i]
+        body = abs(C[i] - O[i])
+        disp = body >= atr * P["disp"] or (i > 0 and A[i - 1] and abs(C[i - 1] - O[i - 1]) >= A[i - 1] * P["disp"])
+
+        v = pivot_high(H, i, P["liq"])
+        if v is not None:
+            liq_h_prev, liq_h = liq_h, v
+        v = pivot_low(Lw, i, P["liq"])
+        if v is not None:
+            liq_l_prev, liq_l = liq_l, v
+        iph = pivot_high(H, i, P["int"]); int_h = iph if iph is not None else int_h
+        ipl = pivot_low(Lw, i, P["int"]); int_l = ipl if ipl is not None else int_l
+
+        lo_r = min(Lw[max(0, i - P["range"] + 1):i + 1])
+        hi_r = max(H[max(0, i - P["range"] + 1):i + 1])
+        eq = (hi_r + lo_r) / 2
+
+        # ---------------- BULL ----------------
+        if bS == 0:
+            if liq_l is not None and int_h is not None and Lw[i] < liq_l and C[i] > liq_l:
+                bS, b = 1, {"sweep": Lw[i], "mss": int_h, "sbar": i, "lvl": liq_l, "leg": H[i], "dstr": 0,
+                            "eql": liq_l_prev is not None and abs(liq_l - liq_l_prev) <= 0.15 * atr}
+        elif bS == 1:
+            if C[i] < b["sweep"] or i - b["sbar"] > P["to_mss"]:
+                bS = 0
+            else:
+                b["sweep"] = min(b["sweep"], Lw[i])
+                b["leg"] = max(b["leg"], H[i])
+                if iph is not None and i - P["int"] > b["sbar"]:
+                    b["mss"] = iph
+                if C[i] > b["mss"] and disp and i >= 3:
+                    b["dstr"] = dstr(i)
+                    if Lw[i] > H[i - 2]:
+                        b.update(top=Lw[i], bot=H[i - 2], mbar=i); bS = 2
+                    elif Lw[i - 1] > H[i - 3]:
+                        b.update(top=Lw[i - 1], bot=H[i - 3], mbar=i); bS = 2
+                    else:
+                        bS = 0
+        elif bS == 2:
+            if C[i] < b["sweep"] or i - b["mbar"] > P["wait"]:
+                bS = 0
+            elif Lw[i] <= b["top"] and C[i] > b["bot"]:
+                if i == last:
+                    e = C[i]
+                    sl = b["sweep"] - atr * P["sl_buf"]
+                    risk = e - sl
+                    if risk > 0:
+                        f = {"HTF": htf_bias_fn() == "bull" if P["use_htf"] else True,
+                             "Discount": e < eq,
+                             "Killzone": in_killzone(T[i]) if P["use_kz"] else True,
+                             "Target>=RR": liq_h is not None and liq_h - e >= risk * P["rr"]}
+                        score = sum(f.values())
+                        if score >= P["min_score"]:
+                            return dict(side="LONG", entry=e, sl=sl, tp=e + risk * P["rr"],
+                                        score=score, factors=f, bar_time=T[i],
+                                        info=classify("LONG", b, e, T[i], pd_fn))
+                bS = 0
+            else:
+                b["leg"] = max(b["leg"], H[i])
+
+        # ---------------- BEAR ----------------
+        if sS == 0:
+            if liq_h is not None and int_l is not None and H[i] > liq_h and C[i] < liq_h:
+                sS, s = 1, {"sweep": H[i], "mss": int_l, "sbar": i, "lvl": liq_h, "leg": Lw[i], "dstr": 0,
+                            "eql": liq_h_prev is not None and abs(liq_h - liq_h_prev) <= 0.15 * atr}
+        elif sS == 1:
+            if C[i] > s["sweep"] or i - s["sbar"] > P["to_mss"]:
+                sS = 0
+            else:
+                s["sweep"] = max(s["sweep"], H[i])
+                s["leg"] = min(s["leg"], Lw[i])
+                if ipl is not None and i - P["int"] > s["sbar"]:
+                    s["mss"] = ipl
+                if C[i] < s["mss"] and disp and i >= 3:
+                    s["dstr"] = dstr(i)
+                    if H[i] < Lw[i - 2]:
+                        s.update(top=Lw[i - 2], bot=H[i], mbar=i); sS = 2
+                    elif H[i - 1] < Lw[i - 3]:
+                        s.update(top=Lw[i - 3], bot=H[i - 1], mbar=i); sS = 2
+                    else:
+                        sS = 0
+        elif sS == 2:
+            if C[i] > s["sweep"] or i - s["mbar"] > P["wait"]:
+                sS = 0
+            elif H[i] >= s["bot"] and C[i] < s["top"]:
+                if i == last:
+                    e = C[i]
+                    sl = s["sweep"] + atr * P["sl_buf"]
+                    risk = sl - e
+                    if risk > 0:
+                        f = {"HTF": htf_bias_fn() == "bear" if P["use_htf"] else True,
+                             "Premium": e > eq,
+                             "Killzone": in_killzone(T[i]) if P["use_kz"] else True,
+                             "Target>=RR": liq_l is not None and e - liq_l >= risk * P["rr"]}
+                        score = sum(f.values())
+                        if score >= P["min_score"]:
+                            return dict(side="SHORT", entry=e, sl=sl, tp=e - risk * P["rr"],
+                                        score=score, factors=f, bar_time=T[i],
+                                        info=classify("SHORT", s, e, T[i], pd_fn))
+                sS = 0
+            else:
+                s["leg"] = min(s["leg"], Lw[i])
+    return None
+
+
+# ---------------------------------------------------------------- Output
+def fmt(x):
+    return f"{x:.8g}"
+
+
+def notify(text, silent=False):
+    print(text, flush=True)
+    if TG_TOKEN and TG_CHAT:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text, "disable_notification": silent}, timeout=15)
+        except Exception as ex:
+            print("Telegram lỗi:", ex)
+
+
+def load_sent():
+    try:
+        with open(SENT_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_sent(sent):
+    with open(SENT_FILE, "w") as f:
+        json.dump(sorted(sent)[-2000:], f)
+
+
+def scan_one(symbol, tier, a, P0):
+    P = dict(P0, min_score={1: a.priority_min_score, 2: a.min_score, 3: a.meme_min_score}[tier])
+    try:
+        d = klines(symbol, a.tf, 300)
+        htf_cache = {}
+
+        def htf_bias():
+            if "v" not in htf_cache:
+                h = klines(symbol, a.htf, 120)["c"]
+                htf_cache["v"] = "bull" if h[-1] > ema_last(h, 50) else "bear"
+            return htf_cache["v"]
+
+        def pd_levels():
+            if "p" not in htf_cache:
+                k = klines(symbol, "1d", 5)
+                htf_cache["p"] = (k["h"][-1], k["l"][-1])  # PDH, PDL (ngày UTC gần nhất đã đóng)
+            return htf_cache["p"]
+
+        sig = detect(d, P, htf_bias, pd_levels)
+        return symbol, tier, sig
+    except Exception as ex:
+        print(f"[{symbol}] lỗi: {ex}", file=sys.stderr)
+        return symbol, tier, None
+
+
+TIER_HEAD = {1: "⭐⭐⭐ ƯU TIÊN ĐẶC BIỆT", 2: "", 3: "🐸 Meme coin (báo im lặng)"}
+
+
+def run_scan(a, P, sent):
+    symbols = list_symbols(a.min_vol)
+    n = {t: sum(1 for _, x in symbols if x == t) for t in (1, 2, 3)}
+    print(f"{datetime.now():%H:%M:%S} quét Futures USDⓈ-M: {n[1]} ưu tiên, {n[2]} altcoin, {n[3]} meme, khung {a.tf}...", flush=True)
+    hits = []
+    with ThreadPoolExecutor(max_workers=a.workers) as ex:
+        for symbol, tier, sig in ex.map(lambda st: scan_one(st[0], st[1], a, P), symbols):
+            if sig:
+                key = f"{symbol}|{sig['side']}|{a.tf}|{sig['bar_time']}"
+                if key not in sent:
+                    sent.add(key)
+                    hits.append((tier, -sig["score"], symbol, sig))
+    hits.sort(key=lambda h: (h[0], h[1], h[2]))  # hạng 1 trước, điểm cao trước
+    for tier, _, symbol, sig in hits:
+        icon = "🟢" if sig["side"] == "LONG" else "🔴"
+        ok = ", ".join(k for k, v in sig["factors"].items() if v)
+        i = sig["info"]
+        sl_pct = abs(sig["sl"] - sig["entry"]) / sig["entry"] * 100
+        head = TIER_HEAD[tier]
+        notify((head + "\n" if head else "") +
+               f"{icon} {sig['side']} {symbol}.P [{a.tf}] | Binance USDⓈ-M Perp\n"
+               f"📌 Mô hình: {i['model']}\n"
+               f"① {i['sweep_txt']}\n② {i['mss_txt']}\n③ {i['fvg_txt']}\n"
+               f"Entry: {fmt(sig['entry'])}\nSL: {fmt(sig['sl'])} (cách {sl_pct:.2f}%)\nTP ({P['rr']}R): {fmt(sig['tp'])}\n"
+               f"Confluence {sig['score']}/4: {ok}\n"
+               f"Ghi chú: {' | '.join(i['tags'])}\n"
+               f"(Chỉ là tín hiệu tham khảo, không phải lời khuyên đầu tư)",
+               silent=(tier == 3))
+    save_sent(sent)
+    print(f"Xong. {len(hits)} tín hiệu mới.", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tf", default="15m", choices=TF_SECONDS.keys())
+    ap.add_argument("--htf", default="4h", choices=TF_SECONDS.keys())
+    ap.add_argument("--min-vol", type=float, default=20_000_000, help="Khối lượng 24h tối thiểu (USDT) cho hạng 2-3")
+    ap.add_argument("--min-score", type=int, default=2, help="Điểm confluence tối thiểu cho altcoin")
+    ap.add_argument("--priority-min-score", type=int, default=1, help="... cho XAU/XAG/BTC/ETH (nhạy hơn)")
+    ap.add_argument("--meme-min-score", type=int, default=3, help="... cho meme coin (khắt khe hơn)")
+    ap.add_argument("--rr", type=float, default=2.0)
+    ap.add_argument("--no-htf", action="store_true")
+    ap.add_argument("--no-killzone", action="store_true")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--once", action="store_true", help="Quét 1 lần rồi thoát")
+    a = ap.parse_args()
+
+    P = dict(liq=10, int=3, to_mss=15, wait=30, disp=1.2, range=50, sl_buf=0.1,
+             rr=a.rr, min_score=a.min_score, use_htf=not a.no_htf, use_kz=not a.no_killzone)
+    sent = load_sent()
+
+    if a.once:
+        run_scan(a, P, sent)
+        return
+    secs = TF_SECONDS[a.tf]
+    notify(f"✅ ICT scanner đã chạy ({a.tf}, Binance USDⓈ-M Futures)")
+    while True:
+        time.sleep(secs - (time.time() % secs) + 3)  # chờ nến đóng
+        try:
+            run_scan(a, P, sent)
+        except Exception as ex:
+            print("Lỗi vòng quét:", ex, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
