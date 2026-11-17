@@ -1,0 +1,30 @@
+name: ICT Scanner
+on:
+  schedule:
+    - cron: "2,17,32,47 * * * *"
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests tzdata
+      - uses: actions/cache@v4
+        with:
+          path: sent_signals.json
+          key: sent-${{ github.run_id }}
+          restore-keys: sent-
+      - name: Gui tin thu Telegram (chi khi bam chay tay)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: curl -s "https://api.telegram.org/bot${TOKEN}/sendMessage" -d chat_id="${CHAT}" -d text="ICT scanner ket noi OK"
+      - run: python ict_scanner.py --tf 15m --once
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
